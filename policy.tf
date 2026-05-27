@@ -1,40 +1,34 @@
-# =============================================================================
-# policies/plan-policy.rego
-#
-# Example Spacelift Plan Policy:
-#   - Warn whenever an IAM resource is being created or modified
-#   - Require approval before any IAM role is created
-#
-# Attach this policy to your stack in the Spacelift UI under Policies.
-# =============================================================================
-
 package spacelift
 
-# Auto-approve runs that only touch "safe" resource types
-approve {
-  no_iam_changes
-}
+# Distinguish between PR runs and tracked branch runs
+proposed := input.spacelift.run.type == "PROPOSED"
 
-# Warn (but still allow) when IAM resources are touched
-warn["IAM resources are being modified — please review carefully"] {
-  iam_change
-}
-
-# Block + require human approval when an IAM role is being CREATED
-deny["Creating IAM roles requires explicit approval — set create_iam_role=false to skip"] {
+# ─── HARD BLOCK ───────────────────────────────────────────────────────────────
+# Never allow static AWS IAM access keys to be created
+deny contains sprintf("static AWS credentials are dangerous (%s)", [resource.address]) if {
   some resource in input.terraform.resource_changes
-  resource.type == "aws_iam_role"
-  resource.change.actions[_] == "create"
+  some action in resource.change.actions
+  action == "create"
+  resource.type == "aws_iam_access_key"
 }
 
-# ------ helpers ------
+# ─── SMART WARN / DENY ────────────────────────────────────────────────────────
+# Deny on PRs, warn on tracked branch — for IAM user creation
+deny contains reason if { proposed; some reason in iam_user_created }
+warn contains reason if { not proposed; some reason in iam_user_created }
 
-iam_change {
+iam_user_created contains sprintf("avoid creating IAM users, use roles instead (%s)", [resource.address]) if {
   some resource in input.terraform.resource_changes
-  startswith(resource.type, "aws_iam_")
-  resource.change.actions[_] != "no-op"
+  some action in resource.change.actions
+  action == "create"
+  resource.type == "aws_iam_user"
 }
 
-no_iam_changes {
-  not iam_change
+# ─── HUMAN REVIEW ─────────────────────────────────────────────────────────────
+# Flag any delete or update for human review (won't block, but pauses autodeploy)
+warn contains sprintf("action '%s' requires human review (%s)", [action, resource.address]) if {
+  review := {"update", "delete"}
+  some resource in input.terraform.resource_changes
+  some action in resource.change.actions
+  review[action]
 }
